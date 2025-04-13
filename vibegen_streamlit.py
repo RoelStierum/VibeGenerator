@@ -86,14 +86,44 @@ def process_track_batch(args):
                 track = item.track
                 if track and track.artist:
                     for artist_name in artist_names:
-                        # Exacte match vereisen (case-insensitive)
-                        if artist_name.lower() == track.artist.name.lower():
+                        def normalize_name(name):
+                            # Convert to lowercase and strip
+                            name = name.lower().strip()
+                            # Remove special characters but keep spaces and &
+                            name = ''.join(c for c in name if c.isalnum() or c.isspace() or c == '&')
+                            return ' '.join(name.split())  # Normalize spaces
+                        
+                        def is_match(artist1, artist2):
+                            # Normalize both names
+                            norm1 = normalize_name(artist1)
+                            norm2 = normalize_name(artist2)
+                            
+                            # Exact match after normalization
+                            if norm1 == norm2:
+                                return True
+                                
+                            # Split into words and check if all words from one are in the other
+                            words1 = set(norm1.split())
+                            words2 = set(norm2.split())
+                            
+                            # If one name is a subset of the other (e.g., "Dimitri Vegas" in "Dimitri Vegas & Like Mike")
+                            if words1.issubset(words2) or words2.issubset(words1):
+                                # Additional check to prevent false matches with single words
+                                if len(words1) > 1 or len(words2) > 1:  # At least one name has multiple words
+                                    return True
+                            
+                            return False
+                        
+                        if is_match(track.artist.name, artist_name):
                             found_tracks.append((track.title, track.artist.name))
+                            print(f"✅ Match gevonden: {track.artist.name} (gezocht: {artist_name})")
                             break
-            except Exception:
+            except Exception as e:
+                print(f"⚠️ Fout bij verwerken van track: {str(e)}")
                 continue
         return found_tracks
-    except Exception:
+    except Exception as e:
+        print(f"⚠️ Fout bij verwerken van batch: {str(e)}")
         return []
 
 def get_lastfm_tracks(username, artist_names, limit=None):
@@ -119,57 +149,82 @@ def get_lastfm_tracks(username, artist_names, limit=None):
         seen = set()
         filtered = []
         total_processed = 0
-        last_timestamp = None
-        empty_batches = 0
         
         try:
-            batch_size = 900  # Terug naar originele batch size
+            # Haal eerst het totale aantal scrobbles op
+            total_scrobbles = user.get_playcount()
+            st.info(f"Totaal aantal scrobbles: {total_scrobbles}")
+            
+            # Bereken batch size en aantal batches
+            batch_size = 950  # Grotere batches voor efficiëntie
             current_time = int(time.time())
             progress_bar = st.progress(0)
             status_text = st.empty()
             found_tracks_text = st.empty()
             
-            # Bereid batches voor parallelle verwerking
-            batches = []
+            # Maak een set van genormaliseerde artiestnamen voor snellere matching
+            normalized_artists = set()
+            for artist in artist_names:
+                def normalize_name(name):
+                    name = name.lower().strip()
+                    name = ''.join(c for c in name if c.isalnum() or c.isspace() or c == '&')
+                    return ' '.join(name.split())
+                normalized_artists.add(normalize_name(artist))
+            
             empty_batch_count = 0
+            total_batches_processed = 0
             
             while empty_batch_count < 3:  # Stop na 3 lege batches
-                # Voeg batch toe
-                batches.append((user, current_time, batch_size, artist_names))
-                current_time = current_time - (30 * 24 * 60 * 60)  # Ga een maand terug
+                total_batches_processed += 1
+                status_text.text(f"Batch {total_batches_processed} - {datetime.fromtimestamp(current_time).strftime('%Y-%m-%d')}")
                 
-                # Verwerk batches in grotere groepen
-                if len(batches) >= 24 or current_time < 0:  # Behouden van grotere groepen voor parallelle verwerking
-                    # Verwerk de huidige groep batches
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:  # Behouden van meer workers
-                        future_to_batch = {executor.submit(process_track_batch, batch): i for i, batch in enumerate(batches)}
-                        
-                        batch_has_tracks = False
-                        for future in concurrent.futures.as_completed(future_to_batch):
-                            batch_index = future_to_batch[future]
-                            try:
-                                batch_tracks = future.result()
-                                if batch_tracks:
-                                    batch_has_tracks = True
-                                    for title, artist in batch_tracks:
-                                        key = (title.lower(), artist.lower())
-                                        if key not in seen:
-                                            seen.add(key)
-                                            filtered.append((title, artist))
-                                            found_tracks_text.text(f"✅ Track gevonden: {title} - {artist}")
-                            except Exception as e:
-                                st.warning(f"Fout bij verwerken van batch {batch_index}: {str(e)}")
-                        
-                        if not batch_has_tracks:
-                            empty_batch_count += 1
-                        else:
-                            empty_batch_count = 0
+                try:
+                    # Haal tracks op voor deze batch
+                    recent_tracks = user.get_recent_tracks(limit=batch_size, time_to=current_time)
                     
-                    # Reset batches voor volgende groep
-                    batches = []
+                    if not recent_tracks:
+                        empty_batch_count += 1
+                        current_time = current_time - (30 * 24 * 60 * 60)  # Ga een maand terug
+                        continue
+                    
+                    # Reset lege batch teller als we tracks vinden
+                    empty_batch_count = 0
+                    
+                    # Verwerk de tracks
+                    for item in recent_tracks:
+                        try:
+                            track = item.track
+                            if track and track.artist:
+                                # Normalize de artiestnaam
+                                artist_name = normalize_name(track.artist.name)
+                                
+                                # Check of de genormaliseerde naam in onze set zit
+                                if artist_name in normalized_artists:
+                                    key = (track.title.lower(), track.artist.name.lower())
+                                    if key not in seen:
+                                        seen.add(key)
+                                        filtered.append((track.title, track.artist.name))
+                                        found_tracks_text.text(f"✅ Track gevonden: {track.title} - {track.artist.name}")
+                        except Exception as e:
+                            continue
+                    
+                    # Update timestamp voor volgende batch
+                    if recent_tracks:
+                        last_track = recent_tracks[-1]
+                        current_time = int(last_track.timestamp)
+                    else:
+                        current_time = current_time - (30 * 24 * 60 * 60)  # Ga een maand terug
+                        
+                except Exception as e:
+                    current_time = current_time - (30 * 24 * 60 * 60)  # Ga een maand terug
+                    continue
                 
                 if current_time < 0:  # Stop als we bij het begin van de tijd zijn
                     break
+                
+                # Update progress bar
+                progress = min(100, int((total_batches_processed * batch_size / total_scrobbles) * 100))
+                progress_bar.progress(progress)
             
             st.success(f"✅ {len(filtered)} unieke tracks gevonden van alle opgegeven artiesten.")
             return filtered
